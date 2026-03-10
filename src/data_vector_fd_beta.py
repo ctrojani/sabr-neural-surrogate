@@ -1,0 +1,226 @@
+# src/data_vector_fd_beta.py
+from __future__ import annotations
+
+import os
+from typing import Tuple, Dict, Any
+
+import numpy as np
+from joblib import Parallel, delayed
+from tqdm import tqdm
+
+from src.MaxK_minK import strike_ratio, ETA_S_MIN, ETA_S_MAX, ETA_SIGMA
+from src.sabr_true_beta_fd import sabr_true_iv_beta_fd
+
+F0 = 1.0
+
+T_MIN, T_MAX       = 1.0 / 365.0, 2.0      
+SIG0_MIN, SIG0_MAX = 0.05, 0.50            
+RHO_MIN, RHO_MAX   = -0.90, 0.90           
+XI_1M_MIN, XI_1M_MAX = 0.05, 4.00          
+TS = 1.0 / 12.0                            
+
+
+BETA_MIN, BETA_MAX = 0.0, 1.0
+
+
+FIG: Dict[int, tuple] = {
+    2: (14.0 / 365.0, 0.30, 1.60, -0.60, "(T = 14D, σ₀ = 30%, ξ = 160%, ρ = −60%)", (25.0, 45.5)),
+    3: (6.0 / 12.0,   0.30, 0.40,  0.00, "(T = 6M,  σ₀ = 30%, ξ = 40%,  ρ = 0%)",    (30.0, 34.5)),
+    4: (1.0,          0.20, 0.30, +0.30, "(T = 1Y,  σ₀ = 20%, ξ = 30%,  ρ = +30%)", (19.0, 26.5)),
+}
+
+
+def xi_bounds_for_T(T: float) -> Tuple[float, float]:
+    
+    lo = XI_1M_MIN * np.sqrt(TS / max(T, 1e-6))
+    hi = XI_1M_MAX * np.sqrt(TS / max(T, 1e-6))
+    return max(0.01, lo), min(6.0, hi)
+
+
+def _build_strikes(F0: float, sigma0: float, rho: float, xi: float, T: float) -> np.ndarray:
+    
+    k_min = F0 * strike_ratio(F0, sigma0, rho, xi, T, ETA_S_MIN, ETA_SIGMA)
+    k_max = F0 * strike_ratio(F0, sigma0, rho, xi, T, ETA_S_MAX, ETA_SIGMA)
+    k_lo, k_hi = (min(k_min, k_max), max(k_min, k_max))
+    # Clip to avoid silly extremes
+    k_lo = max(k_lo, F0 * 1e-4)
+    k_hi = min(k_hi, F0 * 1e+4)
+    # 10 nodes in log-space
+    xgrid = np.linspace(np.log(k_lo / F0), np.log(k_hi / F0), 10, dtype=np.float32)
+    K = F0 * np.exp(xgrid)
+    return K.astype(np.float32)
+
+
+def _one_sample(
+    F0: float,
+    T: float,
+    sigma0: float,
+    xi: float,
+    rho: float,
+    beta: float,
+    *,
+    fd_NX: int = 121,
+    fd_NY: int = 41,
+    fd_NT: int = 600,
+) -> tuple | None:
+    
+    K = _build_strikes(F0, sigma0, rho, xi, T)  
+
+    vols = sabr_true_iv_beta_fd(
+        F=F0,
+        K=K,
+        T=T,
+        alpha=sigma0,
+        beta=beta,
+        rho=rho,
+        nu=xi,
+        NX=fd_NX,
+        NY=fd_NY,
+        NT=fd_NT,
+    ).astype(np.float32)
+
+    if not np.isfinite(vols).all():
+        return None
+
+    xln = np.log(K / F0).astype(np.float32)
+    feats = np.concatenate(
+        [[T, sigma0, xi, rho, beta], xln],
+        dtype=np.float32,
+    )
+    targets = (100.0 * vols).astype(np.float32)  
+    return feats, targets
+
+
+def _one_sample_wrapper(
+    T, sigma0, xi, rho, beta,
+    fd_NX, fd_NY, fd_NT,
+):
+  
+    return _one_sample(
+        F0, T, sigma0, xi, rho, beta,
+        fd_NX=fd_NX, fd_NY=fd_NY, fd_NT=fd_NT,
+    )
+
+
+def _sample_random_dataset(
+    n: int,
+    seed: int = 1234,
+    *,
+    fd_NX: int = 121,
+    fd_NY: int = 41,
+    fd_NT: int = 600,
+    n_jobs: int = 16,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    NOTE: FD is expensive. This uses joblib to parallelize over samples and
+    tqdm to track progress.
+    """
+    rng = np.random.default_rng(seed)
+    X_list, Y_list = [], []
+
+    with tqdm(total=n, desc="[FD-β] samples", unit="sample") as pbar:
+        while len(X_list) < n:
+
+            batch_size = min(512, n - len(X_list))
+            params = []
+            for _ in range(batch_size):
+                T      = float(rng.uniform(T_MIN, T_MAX))
+                sigma0 = float(rng.uniform(SIG0_MIN, SIG0_MAX))
+                rho    = float(rng.uniform(RHO_MIN, RHO_MAX))
+                beta   = float(rng.uniform(BETA_MIN, BETA_MAX))
+                xi_lo, xi_hi = xi_bounds_for_T(T)
+                xi     = float(rng.uniform(xi_lo, xi_hi))
+                params.append((T, sigma0, xi, rho, beta))
+
+
+            results = Parallel(n_jobs=n_jobs)(
+                delayed(_one_sample_wrapper)(
+                    T, sigma0, xi, rho, beta,
+                    fd_NX, fd_NY, fd_NT,
+                )
+                for (T, sigma0, xi, rho, beta) in params
+            )
+
+
+            for res in results:
+                if res is None:
+                    continue
+                X, Y = res
+                X_list.append(X)
+                Y_list.append(Y)
+                pbar.update(1)
+                if len(X_list) >= n:
+                    break
+
+    X_arr = np.stack(X_list, axis=0).astype(np.float32)
+    Y_arr = np.stack(Y_list, axis=0).astype(np.float32)
+    return X_arr, Y_arr
+
+
+
+def sample_domain_grid_and_random_fd_beta(
+    n_train: int = 20_000,
+    n_val: int = 5_000,
+    cache_path: str | None = None,
+    *,
+    fd_NX: int = 121,
+    fd_NY: int = 41,
+    fd_NT: int = 600,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
+    
+    if cache_path is None:
+        cache_path = os.environ.get(
+            "PHASE2_FD_BETA_CACHE",
+            "datasets/phase2_fd_beta_input_big.npz",
+        )
+
+    print(
+        f"[FD-β] building dataset: "
+        f"n_train={n_train}, n_val={n_val}, cache='{cache_path}'"
+    )
+
+    X_tr, Y_tr = _sample_random_dataset(
+        n_train, seed=1234, fd_NX=fd_NX, fd_NY=fd_NY, fd_NT=fd_NT
+    )
+    X_va, Y_va = _sample_random_dataset(
+        n_val, seed=5678, fd_NX=fd_NX, fd_NY=fd_NY, fd_NT=fd_NT
+    )
+
+    meta: Dict[str, Any] = dict(
+        F0=F0,
+        n_train=int(X_tr.shape[0]),
+        n_val=int(X_va.shape[0]),
+        T_range=(T_MIN, T_MAX),
+        sigma0_range=(SIG0_MIN, SIG0_MAX),
+        rho_range=(RHO_MIN, RHO_MAX),
+        beta_range=(BETA_MIN, BETA_MAX),
+        xi_anchor=(XI_1M_MIN, XI_1M_MAX),
+        description="Phase-2 FD-based SABR implied vols with β input (vector 10 strikes)",
+    )
+
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    np.savez_compressed(
+        cache_path,
+        Xtr=X_tr,
+        Ytr=Y_tr,
+        Xva=X_va,
+        Yva=Y_va,
+        meta=meta,
+    )
+
+    print(f"[FD-β] saved cache to {cache_path}")
+    return X_tr, Y_tr, X_va, Y_va, meta
+
+
+def load_phase2_fd_beta_cached(path: str):
+  
+    if not os.path.isfile(path):
+        return None
+    data = np.load(path, allow_pickle=True)
+    return (
+        data["Xtr"],
+        data["Ytr"],
+        data["Xva"],
+        data["Yva"],
+        data["meta"].item(),
+    )
